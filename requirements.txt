@@ -1,3 +1,4 @@
 bencodepy
-requests
+werkzeug
 Flask
+orjson
