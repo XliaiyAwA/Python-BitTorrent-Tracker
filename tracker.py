@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-from __future__ import annotations
-
 import asyncio
 import functools
 import hashlib
@@ -18,19 +16,17 @@ import socket
 import struct
 import sys
 import tempfile
-import threading
 import time
 from dataclasses import dataclass, asdict, fields
-from typing import Any
+from typing import Any, Self
 
 try:
     import bencodepy  # type: ignore
     import orjson  # type: ignore
-    from flask import Flask, Response, request  # type: ignore
-    from werkzeug.serving import BaseWSGIServer, make_server  # type: ignore
+    from aiohttp import web  # type: ignore
 except ImportError as exc:  # pragma: no cover
     sys.stderr.write(
-        f"缺少依赖：{exc}. 请执行: pip install bencodepy orjson flask werkzeug\n"
+        f"缺少依赖：{exc}。请执行: pip install bencodepy orjson aiohttp\n"
     )
     raise
 
@@ -68,7 +64,6 @@ IP: str = os.environ.get("TRACKER_IP", "0.0.0.0")
 PORT: int = _env_int("TRACKER_PORT", 6969)
 UDP_PORT: int = _env_int("TRACKER_UDP_PORT", PORT)
 
-# TRACKER_INTERVAL 控制普通重 announce 间隔；未设置时与 MIN_INTERVAL 保持一致（向后兼容）
 MIN_INTERVAL: int = _env_int("TRACKER_MIN_INTERVAL", _env_int("MIN_INTERVAL", 900))
 INTERVAL: int = _env_int("TRACKER_INTERVAL", MIN_INTERVAL)
 PEER_TIMEOUT: int = _env_int("PEER_TIMEOUT", 1800)
@@ -90,21 +85,20 @@ BEHIND_PROXY: bool = _env_bool("TRACKER_BEHIND_PROXY", False)
 UDP_CONNECTION_TIMEOUT: int = _env_int("UDP_CONNECTION_TIMEOUT", 120)
 UDP_CONN_CLEANUP_INTERVAL: int = _env_int("UDP_CONN_CLEANUP_INTERVAL", 30)
 
-# UDP 响应推荐 MTU：避免 IP 分片（1500 - IP头20 - UDP头8 = 1472）
+MAX_UDP_PACKET_SIZE: int = _env_int("MAX_UDP_PACKET_SIZE", 4096)
+MAX_HTTP_BODY_SIZE: int = _env_int("MAX_HTTP_BODY_SIZE", 65536)
+
 UDP_MTU: int = 1400
-# announce 响应头大小：action(4) + trans_id(4) + interval(4) + leechers(4) + seeders(4) = 20
 UDP_ANNOUNCE_HDR_SIZE: int = 20
 
-# 预编译 struct（BEP 15 协议格式）
-COMPACT4_STRUCT = struct.Struct("!4sH")          # IPv4 (4) + port (2) = 6 字节
-COMPACT6_STRUCT = struct.Struct("!16sH")         # IPv6 (16) + port (2) = 18 字节
-UDP_CONNECT_RESPONSE = struct.Struct("!IIQ")      # action, trans_id, conn_id
-UDP_ANNOUNCE_HEADER = struct.Struct("!IIIII")     # action, trans_id, interval, leechers, seeders
-UDP_ERROR_HEADER = struct.Struct("!II")           # action, trans_id
-UDP_SCRAPE_HEADER = struct.Struct("!II")          # action, trans_id
-UDP_SCRAPE_STATS = struct.Struct("!III")          # seeders, completed, leechers
-# BEP 15 announce 请求（从偏移 16 起）：info_hash(20) + peer_id(20) + downloaded(8) +
-# left(8) + uploaded(8) + event(4, u32) + ip(4, u32) + key(4, u32) + numwant(4, i32) + port(2, u16)
+# 预编译 struct
+COMPACT4_STRUCT = struct.Struct("!4sH")
+COMPACT6_STRUCT = struct.Struct("!16sH")
+UDP_CONNECT_RESPONSE = struct.Struct("!IIQ")
+UDP_ANNOUNCE_HEADER = struct.Struct("!IIIII")
+UDP_ERROR_HEADER = struct.Struct("!II")
+UDP_SCRAPE_HEADER = struct.Struct("!II")
+UDP_SCRAPE_STATS = struct.Struct("!III")
 UDP_ANNOUNCE_REQUEST = struct.Struct("!20s20sQQQIIIiH")
 
 UDP_PROTOCOL_ID: int = 0x41727101980
@@ -114,24 +108,13 @@ ACTION_SCRAPE: int = 2
 ACTION_ERROR: int = 3
 
 UINT32_MAX: int = 0xFFFFFFFF
+_SENTINEL_HUGE: int = 1 << 63
 
 VALID_EVENTS: frozenset[str] = frozenset({"started", "completed", "stopped"})
-
-# BEP 15 UDP 事件映射
 UDP_EVENT_MAP: dict[int, str | None] = {0: None, 1: "completed", 2: "started", 3: "stopped"}
 
-
-# ---------------------------------------------------------------------------
-# Python 版本兼容性
-# ---------------------------------------------------------------------------
-_PY_310_PLUS: bool = sys.version_info >= (3, 10)
-
-
-def _dataclass_kwargs(**kwargs: Any) -> dict[str, Any]:
-    """根据 Python 版本返回安全的 dataclass 参数。"""
-    if not _PY_310_PLUS:
-        kwargs.pop("slots", None)
-    return kwargs
+# compact 参数真值集合（小写）— BEP 23 仅规定 "1"，但部分客户端发送其他真值
+_COMPACT_TRUTHY: frozenset[bytes] = frozenset({b"1", b"true", b"yes", b"on"})
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +132,15 @@ logger = logging.getLogger("tracker")
 # ---------------------------------------------------------------------------
 _HEX_RE = re.compile(rb"^[0-9a-fA-F]+$")
 
+_HEX_NIBBLE: list[int] = [-1] * 256
+for _c in range(256):
+    if 48 <= _c <= 57:
+        _HEX_NIBBLE[_c] = _c - 48
+    elif 65 <= _c <= 70:
+        _HEX_NIBBLE[_c] = _c - 55
+    elif 97 <= _c <= 102:
+        _HEX_NIBBLE[_c] = _c - 87
+
 
 def bytes_to_hex(b: bytes) -> str:
     return b.hex()
@@ -162,12 +154,23 @@ def hex_to_bytes(s: str | bytes) -> bytes:
     return bytes.fromhex(s)
 
 
-def constant_time_compare(a: str, b: str) -> bool:
-    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+def constant_time_compare(a: str | bytes, b: str | bytes) -> bool:
+    if isinstance(a, str):
+        a = a.encode("utf-8")
+    if isinstance(b, str):
+        b = b.encode("utf-8")
+    return hmac.compare_digest(a, b)
+
+
+def _constant_time_compare_int(a: int, b: int) -> bool:
+    """恒时比较两个整数（64 位无符号掩码，支持负数/大整数）。"""
+    return hmac.compare_digest(
+        (a & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "big"),
+        (b & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "big"),
+    )
 
 
 def _percent_decode_bytes(b: bytes) -> bytes:
-    """就地 percent-decoding，避免分配大字符串。"""
     if not b or (b"%" not in b and b"+" not in b):
         return b
     n = len(b)
@@ -180,13 +183,13 @@ def _percent_decode_bytes(b: bytes) -> bytes:
             i += 1
             j += 1
         elif c == ord("%") and i + 2 < n:
-            try:
-                result[j] = int(b[i + 1 : i + 3], 16)
+            high = _HEX_NIBBLE[b[i + 1]]
+            low = _HEX_NIBBLE[b[i + 2]]
+            if high >= 0 and low >= 0:
+                result[j] = (high << 4) | low
                 i += 3
                 j += 1
                 continue
-            except ValueError:
-                pass
             result[j] = c
             i += 1
             j += 1
@@ -198,7 +201,6 @@ def _percent_decode_bytes(b: bytes) -> bytes:
 
 
 def _parse_query_string_raw(qs: bytes) -> dict[bytes, list[bytes]]:
-    """极简 query string 解析，保留重复 key。"""
     result: dict[bytes, list[bytes]] = {}
     if not qs:
         return result
@@ -211,7 +213,11 @@ def _parse_query_string_raw(qs: bytes) -> dict[bytes, list[bytes]]:
             key, val = item, b""
         key = _percent_decode_bytes(key)
         val = _percent_decode_bytes(val)
-        result.setdefault(key, []).append(val)
+        lst = result.get(key)
+        if lst is None:
+            result[key] = [val]
+        else:
+            lst.append(val)
     return result
 
 
@@ -225,7 +231,6 @@ def _get_all(parsed_qs: dict[bytes, list[bytes]], key: str) -> list[bytes]:
 
 
 def _get_int(parsed_qs: dict[bytes, list[bytes]], key: str, default: int = 0) -> int:
-    """解析非负整数字段（uploaded/downloaded 等），负数钳位为 0。"""
     val = _get_first(parsed_qs, key)
     if val is None:
         return default
@@ -236,15 +241,21 @@ def _get_int(parsed_qs: dict[bytes, list[bytes]], key: str, default: int = 0) ->
 
 
 def _get_int_left(parsed_qs: dict[bytes, list[bytes]], key: str, default: int = 0) -> int:
-    """解析 left 字段。负数表示异常值，视为极大值（leecher），而不是 0（seeder）。"""
     val = _get_first(parsed_qs, key)
     if val is None:
         return default
     try:
         v = int(val)
-        return v if v >= 0 else (1 << 63)
+        return v if v >= 0 else _SENTINEL_HUGE
     except (ValueError, TypeError):
         return default
+
+
+def _is_truthy(val: bytes | None) -> bool:
+    """判断 bencoded/query 参数是否为真值（1/true/True）。"""
+    if val is None:
+        return False
+    return val.lower() in _COMPACT_TRUTHY
 
 
 @functools.lru_cache(maxsize=32768)
@@ -253,17 +264,11 @@ def _is_private_ip(ip: str) -> bool:
         addr = ipaddress.ip_address(ip)
     except ValueError:
         return True
-    return (
-        addr.is_private
-        or addr.is_loopback
-        or addr.is_multicast
-        or addr.is_unspecified
-    )
+    return addr.is_private or addr.is_loopback or addr.is_multicast or addr.is_unspecified
 
 
 @functools.lru_cache(maxsize=32768)
 def _normalize_ip(ip_str: str) -> str:
-    """将 IPv4-mapped IPv6 / 6to4 / Teredo 转换为 IPv4 字符串，同时去除 zone ID。"""
     try:
         addr = ipaddress.ip_address(ip_str)
     except ValueError:
@@ -276,7 +281,6 @@ def _normalize_ip(ip_str: str) -> str:
         if addr.teredo is not None:
             _, client = addr.teredo
             return str(client)
-        # 去除 zone ID（如 %eth0）
         return addr.compressed
     return ip_str
 
@@ -302,13 +306,6 @@ def _maybe_hex_to_bytes(s: bytes | None) -> bytes | None:
 
 
 def _udp_key_from_api_key() -> int | None:
-    """将 API_KEY 转换为 UDP announce 中的 4 字节 key。
-
-    优先级：
-    1. 整数形式的 key
-    2. 8 字符 hex 形式
-    3. 任意字符串 -> 取 SHA-256 前 4 字节（业界惯例）
-    """
     if not API_KEY:
         return None
     try:
@@ -327,7 +324,7 @@ def _udp_key_from_api_key() -> int | None:
 # ---------------------------------------------------------------------------
 # 数据模型
 # ---------------------------------------------------------------------------
-@dataclass(**_dataclass_kwargs(slots=True, frozen=True))
+@dataclass(slots=True, frozen=True)
 class Peer:
     peer_id: bytes
     ip: str
@@ -343,7 +340,7 @@ class Peer:
         return d
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Peer:
+    def from_dict(cls, data: dict[str, Any]) -> Self:
         return cls(
             peer_id=hex_to_bytes(data.get("peer_id", "")),
             ip=data.get("ip", "0.0.0.0"),
@@ -355,7 +352,7 @@ class Peer:
         )
 
 
-@dataclass(**_dataclass_kwargs(slots=True))
+@dataclass(slots=True)
 class TorrentInfo:
     info_hash: bytes
     name: str = ""
@@ -371,7 +368,7 @@ class TorrentInfo:
         return d
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> TorrentInfo:
+    def from_dict(cls, data: dict[str, Any]) -> Self:
         filtered = {k: v for k, v in data.items() if k in _TORRENT_INFO_FIELDS}
         filtered["info_hash"] = hex_to_bytes(data.get("info_hash", ""))
         return cls(**filtered)
@@ -381,34 +378,23 @@ _TORRENT_INFO_FIELDS: frozenset[str] = frozenset(f.name for f in fields(TorrentI
 
 
 # ---------------------------------------------------------------------------
-# 核心 Tracker 逻辑
+# 异步 Tracker 核心
 # ---------------------------------------------------------------------------
 class Tracker:
-    """线程安全的内存型 Tracker。
-
-    - torrents:       info_hash -> { peer_id -> Peer }
-    - torrent_info:   info_hash -> TorrentInfo
-    - completed_count: info_hash -> int（downloads 总数，BEP 3 语义）
-    - _stats_cache:   info_hash -> (seeders, leechers, last_update) 统计缓存
-    """
 
     def __init__(self) -> None:
         self.data_file: str = DATA_FILE
-        self.lock: threading.RLock = threading.RLock()
+        self.lock: asyncio.Lock = asyncio.Lock()
         self.torrents: dict[bytes, dict[bytes, Peer]] = {}
         self.torrent_info: dict[bytes, TorrentInfo] = {}
         self.completed_count: dict[bytes, int] = {}
         self._stats_cache: dict[bytes, tuple[int, int, float]] = {}
-        self.load_state()
+        self._stop_event = asyncio.Event()
 
-        self._stop_event = threading.Event()
-        self._cleanup_thread = threading.Thread(
-            target=self._cleanup_loop, daemon=True, name="cleanup"
-        )
-        self._cleanup_thread.start()
+    async def initialize(self) -> None:
+        await self._load_state_async()
 
-    # ---- 过期 / 清理 ----
-    def _expire_peers(
+    async def _expire_peers(
         self, info_hash: bytes, now: float | None = None
     ) -> dict[bytes, Peer]:
         peers = self.torrents.get(info_hash)
@@ -425,33 +411,34 @@ class Tracker:
         self._stats_cache.pop(info_hash, None)
         return {}
 
-    def _cleanup_loop(self) -> None:
+    async def _cleanup_loop(self) -> None:
         while not self._stop_event.is_set():
-            self._stop_event.wait(CLEANUP_INTERVAL)
-            if self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=CLEANUP_INTERVAL)
                 break
-            self.cleanup_once()
+            except asyncio.TimeoutError:
+                pass
+            await self._cleanup_once()
 
-    def cleanup_once(self) -> None:
+    async def _cleanup_once(self) -> None:
         now = time.time()
-        with self.lock:
+        async with self.lock:
             for info_hash in list(self.torrents.keys()):
-                self._expire_peers(info_hash, now)
+                await self._expire_peers(info_hash, now)
         logger.debug("清理完成，活跃种子数：%d", len(self.torrents))
 
-    # ---- 状态持久化 ----
+    @staticmethod
     def _build_state_entry(
-        self, info: TorrentInfo, peers: list[Peer], completed: int
+        info: TorrentInfo, peers: list[Peer], completed: int
     ) -> dict[str, Any]:
-        seeders = leechers = 0
+        seeders = 0
         total_up = total_down = 0
         for p in peers:
             if p.left == 0:
                 seeders += 1
-            else:
-                leechers += 1
             total_up += p.uploaded
             total_down += p.downloaded
+        leechers = len(peers) - seeders
         return {
             "info": info.to_dict(),
             "peers_info": [p.to_dict() for p in peers],
@@ -465,9 +452,9 @@ class Tracker:
             },
         }
 
-    def save_state(self) -> None:
+    async def save_state(self) -> None:
         snapshot: dict[str, Any] = {}
-        with self.lock:
+        async with self.lock:
             now = time.time()
             cutoff = now - PEER_TIMEOUT
             for info_hash, info in self.torrent_info.items():
@@ -490,30 +477,46 @@ class Tracker:
                         self.completed_count.get(info_hash, 0),
                     )
 
-        tmp_path: str | None = None
+        payload = _json_dumps({"torrents": snapshot}, indent=2)
+        await asyncio.to_thread(self._atomic_write, self.data_file, payload)
+        logger.info("状态已保存至 %s（种子数：%d）", self.data_file, len(snapshot))
+
+    @staticmethod
+    def _atomic_write(filepath: str, data: bytes) -> None:
+        """原子写入：先写临时文件，再 os.replace。"""
+        dirname = os.path.dirname(filepath) or "."
+        fd, tmp_path = tempfile.mkstemp(
+            suffix=".tmp", prefix="tracker_state_", dir=dirname
+        )
+        closed = False
         try:
-            dirname = os.path.dirname(self.data_file) or "."
-            fd, tmp_path = tempfile.mkstemp(
-                suffix=".tmp", prefix="tracker_state_", dir=dirname
-            )
             with os.fdopen(fd, "wb") as f:
-                f.write(_json_dumps({"torrents": snapshot}, indent=2))
-            os.replace(tmp_path, self.data_file)
-            logger.info("状态已保存至 %s（种子数：%d）", self.data_file, len(snapshot))
-        except Exception as exc:
-            logger.error("保存状态失败：%s", exc)
-            if tmp_path is not None:
+                f.write(data)
+            # fd 已被 fdopen 上下文管理器关闭
+            closed = True
+            os.replace(tmp_path, filepath)
+        except Exception:
+            if not closed:
                 try:
-                    os.unlink(tmp_path)
+                    os.close(fd)
                 except OSError:
                     pass
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
-    def load_state(self) -> None:
+    @staticmethod
+    def _read_file_sync(filepath: str) -> bytes:
+        with open(filepath, "rb") as f:
+            return f.read()
+
+    async def _load_state_async(self) -> None:
         if not os.path.exists(self.data_file):
             return
         try:
-            with open(self.data_file, "rb") as f:
-                raw = f.read()
+            raw = await asyncio.to_thread(self._read_file_sync, self.data_file)
             if not raw:
                 return
             state = _json_loads(raw)
@@ -556,11 +559,10 @@ class Tracker:
             self.completed_count = {}
             self._stats_cache = {}
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         self._stop_event.set()
 
-    # ---- 核心 API ----
-    def announce(
+    async def announce(
         self,
         info_hash: bytes,
         peer_id: bytes,
@@ -572,9 +574,8 @@ class Tracker:
         event: str | None,
         numwant: int = 50,
     ) -> tuple[dict[str, int], list[Peer]]:
-        """处理一次 announce，返回 (stats, peers)。"""
         is_private = not ALLOW_PRIVATE_IP and _is_private_ip(ip)
-        with self.lock:
+        async with self.lock:
             peers = self.torrents.get(info_hash)
             if peers is None:
                 peers = {}
@@ -590,14 +591,33 @@ class Tracker:
 
             if event == "stopped":
                 peers.pop(peer_id, None)
-            elif not is_private:
-                # BEP 3：completed 事件表示下载完成，left 必须视为 0
+                seeders = leechers = 0
+                candidates: list[Peer] = []
+                active: dict[bytes, Peer] = {}
+                for pid, p in peers.items():
+                    if p.last_seen < cutoff:
+                        continue
+                    active[pid] = p
+                    if p.left == 0:
+                        seeders += 1
+                    else:
+                        leechers += 1
+                    if p.port > 0 and pid != peer_id:
+                        candidates.append(p)
+                self.torrents[info_hash] = active
+                self._stats_cache[info_hash] = (seeders, leechers, now)
+                completed = self.completed_count.get(info_hash, 0)
+                return (
+                    {"complete": seeders, "incomplete": leechers, "downloaded": completed},
+                    [],
+                )
+
+            if not is_private:
                 if event == "completed":
                     left = 0
                     if old_peer is None or old_peer.left > 0:
                         self.completed_count[info_hash] += 1
 
-                # 已存在的 peer 始终允许更新；新 peer 仅在未达上限时加入
                 if peer_id in peers or len(peers) < MAX_PEERS_PER_TORRENT:
                     peers[peer_id] = Peer(
                         peer_id=peer_id,
@@ -614,23 +634,20 @@ class Tracker:
                         bytes_to_hex(info_hash),
                     )
 
-            # 单次遍历：清理过期 + 统计 + 采样
             seeders = leechers = 0
-            candidates: list[Peer] = []
-            expired: list[bytes] = []
+            candidates = []
+            active = {}
             for pid, p in peers.items():
                 if p.last_seen < cutoff:
-                    expired.append(pid)
                     continue
+                active[pid] = p
                 if p.left == 0:
                     seeders += 1
                 else:
                     leechers += 1
                 if p.port > 0 and pid != peer_id:
                     candidates.append(p)
-            for pid in expired:
-                del peers[pid]
-
+            self.torrents[info_hash] = active
             self._stats_cache[info_hash] = (seeders, leechers, now)
 
             completed = self.completed_count.get(info_hash, 0)
@@ -640,7 +657,6 @@ class Tracker:
                 "downloaded": completed,
             }
 
-        # 锁外进行随机采样，避免阻塞并发请求
         if event == "stopped" or is_private or numwant <= 0 or not candidates:
             return stats, []
 
@@ -651,8 +667,8 @@ class Tracker:
             return stats, out
         return stats, random.sample(candidates, numwant)
 
-    def scrape(self, info_hashes: list[bytes]) -> dict[bytes, dict[bytes, int]]:
-        with self.lock:
+    async def scrape(self, info_hashes: list[bytes]) -> dict[bytes, dict[bytes, int]]:
+        async with self.lock:
             now = time.time()
             cutoff = now - PEER_TIMEOUT
             result: dict[bytes, dict[bytes, int]] = {}
@@ -678,12 +694,12 @@ class Tracker:
                 }
             return result
 
-    def get_all_stats(self) -> dict[str, dict[str, Any]]:
-        with self.lock:
+    async def get_all_stats(self) -> dict[str, dict[str, Any]]:
+        async with self.lock:
             now = time.time()
             cutoff = now - PEER_TIMEOUT
             result: dict[str, dict[str, Any]] = {}
-            all_hashes = set(self.torrent_info.keys()) | set(self.torrents.keys())
+            all_hashes = self.torrent_info.keys() | self.torrents.keys()
             for info_hash in all_hashes:
                 info = self.torrent_info.get(info_hash)
                 peers = self.torrents.get(info_hash, {})
@@ -715,19 +731,36 @@ class Tracker:
 
 
 # ---------------------------------------------------------------------------
-# Flask 辅助函数
+# HTTP 辅助函数
 # ---------------------------------------------------------------------------
-def _bencode_error(message: str, status: int = 200) -> Response:
+def _bencode_response(data: dict[Any, Any], status: int = 200) -> web.Response:
+    try:
+        payload = bencodepy.encode(data)
+    except Exception:
+        payload = b"d14:failure reason11:encode errore"
+    return web.Response(body=payload, status=status, content_type="text/plain")
+
+
+def _bencode_error(message: str) -> web.Response:
+    """BEP 3: tracker 错误响应始终返回 HTTP 200 + failure reason。"""
     try:
         payload = bencodepy.encode({b"failure reason": message.encode("utf-8")})
     except Exception:
         msg = message.encode("utf-8")
         payload = b"d14:failure reason" + str(len(msg)).encode() + b":" + msg + b"e"
-    return Response(payload, status=status, mimetype="text/plain")
+    return web.Response(body=payload, status=200, content_type="text/plain")
 
 
-def _get_client_ip_from_request() -> str:
-    """从 HTTP 请求中获取对等体 IP。"""
+def _json_response(data: Any, status: int = 200, indent: int | None = None) -> web.Response:
+    body = _json_dumps(data, indent=indent) if indent is not None else _json_dumps(data)
+    return web.Response(body=body, status=status, content_type="application/json")
+
+
+def _json_error(message: str, status: int = 400) -> web.Response:
+    return _json_response({"error": message}, status=status)
+
+
+def _get_client_ip(request: web.Request) -> str:
     if BEHIND_PROXY:
         xff = request.headers.get("X-Forwarded-For", "")
         ip = xff.split(",")[0].strip() if xff else ""
@@ -735,30 +768,30 @@ def _get_client_ip_from_request() -> str:
             ip = request.headers.get("X-Real-IP", "")
         if ip and _is_valid_ip(ip):
             return _normalize_ip(ip)
-    raw = request.remote_addr or "127.0.0.1"
-    return _normalize_ip(raw)
+    transport = request.transport
+    if transport is not None:
+        peername = transport.get_extra_info("peername")
+        if peername:
+            return _normalize_ip(peername[0])
+    return "127.0.0.1"
 
 
-def _validate_hash(h: bytes | None, name: str) -> Response | None:
+def _validate_hash(h: bytes | None, name: str) -> web.Response | None:
     if h is None:
-        return _bencode_error(f"Missing {name}", 400)
+        return _bencode_error(f"Missing {name}")
     if len(h) != 20:
         return _bencode_error(
             f"Invalid {name} length ({len(h)} bytes, expected 20). "
-            f"Pass raw 20-byte binary or 40-char hex string.",
-            400,
+            f"Pass raw 20-byte binary or 40-char hex string."
         )
     return None
 
 
 def _encode_compact_peers(peers: list[Peer]) -> tuple[bytes, bytes]:
-    """编码 compact peer 列表。
-
-    返回 (ipv4_blob, ipv6_blob)。BEP 7 规定：peers 始终为 IPv4 compact，
-    peers6 为 IPv6 compact（如果存在）。
-    """
-    parts4: list[bytes] = []
-    parts6: list[bytes] = []
+    n = len(peers)
+    parts4: list[bytes] = [b""] * n if n > 0 else []
+    parts6: list[bytes] = [b""] * n if n > 0 else []
+    i4 = i6 = 0
     for p in peers:
         if p.port <= 0 or p.port > 65535:
             continue
@@ -769,82 +802,72 @@ def _encode_compact_peers(peers: list[Peer]) -> tuple[bytes, bytes]:
             except OSError:
                 logger.debug("跳过无效 IPv6 peer: %s", ip)
                 continue
-            parts6.append(COMPACT6_STRUCT.pack(packed, p.port))
+            parts6[i6] = COMPACT6_STRUCT.pack(packed, p.port)
+            i6 += 1
         else:
             try:
                 packed = socket.inet_pton(socket.AF_INET, ip)
             except OSError:
                 logger.debug("跳过无效 IPv4 peer: %s", ip)
                 continue
-            parts4.append(COMPACT4_STRUCT.pack(packed, p.port))
-    return b"".join(parts4), b"".join(parts6)
+            parts4[i4] = COMPACT4_STRUCT.pack(packed, p.port)
+            i4 += 1
+    return b"".join(parts4[:i4]), b"".join(parts6[:i6])
 
 
-def _json_response(data: Any, status: int = 200, indent: int | None = None) -> Response:
-    body = _json_dumps(data, indent=indent) if indent is not None else _json_dumps(data)
-    return Response(body, status=status, mimetype="application/json")
-
-
-def _check_api_key_header() -> Response | None:
+def _check_api_key(request: web.Request) -> web.Response | None:
     if not API_KEY:
         return None
     provided = request.headers.get("X-API-Key", "")
     if not constant_time_compare(provided, API_KEY):
-        return _json_response({"error": "Unauthorized"}, status=401)
+        return _json_error("Unauthorized", status=401)
     return None
 
 
-def _check_announce_key(parsed_qs: dict[bytes, list[bytes]]) -> Response | None:
+def _check_announce_key(parsed_qs: dict[bytes, list[bytes]]) -> web.Response | None:
     if not API_KEY or not PROTECT_ANNOUNCE:
         return None
     key_bytes = _get_first(parsed_qs, "key")
     if key_bytes is None:
-        return _bencode_error("Missing key (private tracker)", 403)
-    if not constant_time_compare(key_bytes.decode("ascii", errors="replace"), API_KEY):
-        return _bencode_error("Invalid key (private tracker)", 403)
+        return _bencode_error("Missing key (private tracker)")
+    if not constant_time_compare(key_bytes, API_KEY.encode("utf-8")):
+        return _bencode_error("Invalid key (private tracker)")
     return None
 
 
-def _check_scrape_key(parsed_qs: dict[bytes, list[bytes]]) -> Response | None:
+def _check_scrape_key(parsed_qs: dict[bytes, list[bytes]]) -> web.Response | None:
     if not API_KEY or not PROTECT_SCRAPE:
         return None
     key_bytes = _get_first(parsed_qs, "key")
     if key_bytes is None:
-        return _bencode_error("Missing key (private tracker)", 403)
-    if not constant_time_compare(key_bytes.decode("ascii", errors="replace"), API_KEY):
-        return _bencode_error("Invalid key (private tracker)", 403)
+        return _bencode_error("Missing key (private tracker)")
+    if not constant_time_compare(key_bytes, API_KEY.encode("utf-8")):
+        return _bencode_error("Invalid key (private tracker)")
     return None
 
 
 # ---------------------------------------------------------------------------
-# 异步 UDP Tracker 服务端
+# 异步 UDP Tracker
 # ---------------------------------------------------------------------------
 class _AsyncUDPTracker:
-    """基于 asyncio 的 UDP Tracker（BEP 15）。
 
-    直接在网络事件循环中处理数据包，不再通过 ThreadPoolExecutor 调用 Tracker，
-    降低线程切换开销。Tracker 内部的 RLock 保证与 HTTP 线程安全共享状态。
-    """
-
-    def __init__(self, host: str, port: int, tracker: Tracker) -> None:
+    def __init__(self, host: str, port: int, tracker: Tracker, stop_event: asyncio.Event) -> None:
         self.host = host
         self.port = port
         self.tracker = tracker
+        self._stop_event = stop_event
         self.transport: asyncio.DatagramTransport | None = None
-        # 连接 ID 字典，所有访问都在 asyncio 事件循环线程，无需锁
         self.connections: dict[tuple[str, int], tuple[int, float]] = {}
         self._udp_key = _udp_key_from_api_key()
-        self._key_required = bool(
-            self._udp_key is not None and PROTECT_ANNOUNCE
-        )
-        # 限制并发处理的 UDP 请求数，防止突发流量导致内存爆炸
+        self._key_required = bool(self._udp_key is not None and PROTECT_ANNOUNCE)
         self._sem = asyncio.Semaphore(256)
 
     def connection_made(self, transport: asyncio.DatagramTransport) -> None:
         self.transport = transport
 
     def datagram_received(self, data: bytes, addr: tuple[Any, ...]) -> None:
-        """异步回调：收到 UDP 数据包时由事件循环调用。"""
+        if len(data) > MAX_UDP_PACKET_SIZE:
+            return
         asyncio.create_task(self._handle_with_sem(data, addr))
 
     def error_received(self, exc: Exception) -> None:
@@ -857,19 +880,15 @@ class _AsyncUDPTracker:
 
     @staticmethod
     def _addr_key(addr: tuple[Any, ...]) -> tuple[str, int]:
-        """将任意长度的地址元组规范化为 (host, port) 二元组。
-
-        IPv6 的 datagram_received 返回 4 元组 (host, port, flowinfo, scope_id)，
-        IPv4 返回 2 元组 (host, port)。统一用前两项作为连接键避免 flowinfo/scope_id
-        导致同一客户端被视为不同连接。
-        """
         return (addr[0], addr[1])
 
-    # ---- 连接清理（后台 asyncio 任务） ----
     async def _cleanup_connections_loop(self) -> None:
-        """定期清理过期连接 ID。"""
-        while True:
-            await asyncio.sleep(UDP_CONN_CLEANUP_INTERVAL)
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=UDP_CONN_CLEANUP_INTERVAL)
+                break
+            except asyncio.TimeoutError:
+                pass
             self._cleanup_connections(time.time())
 
     def _cleanup_connections(self, now: float) -> None:
@@ -884,11 +903,9 @@ class _AsyncUDPTracker:
             logger.debug("清理了 %d 个过期 UDP 连接", len(expired))
 
     async def _handle_with_sem(self, data: bytes, addr: tuple[Any, ...]) -> None:
-        """带并发限制的请求处理包装。"""
         async with self._sem:
             await self._handle(data, addr)
 
-    # ---- 请求分发 ----
     async def _handle(self, data: bytes, addr: tuple[Any, ...]) -> None:
         if len(data) < 16:
             return
@@ -900,24 +917,20 @@ class _AsyncUDPTracker:
 
         addr_key = self._addr_key(addr)
 
-        # Connect 请求
         if first_qword == UDP_PROTOCOL_ID:
             if action == ACTION_CONNECT:
                 self._handle_connect(trans_id, addr, addr_key)
             return
 
-        # 其他请求需要有效的 conn_id（BEP 15：自创建起 2 分钟内有效）
         conn_id = first_qword
         stored = self.connections.get(addr_key)
-        now = time.time()
-        if (
-            stored is None
-            or stored[0] != conn_id
-            or (now - stored[1]) > UDP_CONNECTION_TIMEOUT
-        ):
+        if stored is None or not _constant_time_compare_int(stored[0], conn_id):
             self._send_error(trans_id, "Invalid connection ID", addr)
             return
-        # 不刷新时间戳，保证 connection_id 不会变成永久有效
+        now = time.time()
+        if (now - stored[1]) > UDP_CONNECTION_TIMEOUT:
+            self._send_error(trans_id, "Invalid connection ID", addr)
+            return
 
         try:
             if action == ACTION_ANNOUNCE:
@@ -929,8 +942,9 @@ class _AsyncUDPTracker:
         except Exception:
             logger.exception("UDP 处理异常，来源 %s:%d", addr[0], addr[1])
 
-    def _handle_connect(self, trans_id: int, addr: tuple[Any, ...], addr_key: tuple[str, int]) -> None:
-        # BEP 15：connection_id 自创建起 2 分钟内有效，刷新会扩大攻击窗口，因此只记录创建时间
+    def _handle_connect(
+        self, trans_id: int, addr: tuple[Any, ...], addr_key: tuple[str, int]
+    ) -> None:
         conn_id = secrets.randbits(64)
         self.connections[addr_key] = (conn_id, time.time())
         response = UDP_CONNECT_RESPONSE.pack(ACTION_CONNECT, trans_id, conn_id)
@@ -939,9 +953,8 @@ class _AsyncUDPTracker:
     def _validate_udp_key(self, key: int) -> bool:
         if not self._key_required:
             return True
-        return key == (self._udp_key or 0)
+        return _constant_time_compare_int(key, self._udp_key or 0)
 
-    # ---- Announce ----
     async def _handle_announce(
         self, data: bytes, trans_id: int, addr: tuple[Any, ...]
     ) -> None:
@@ -965,14 +978,12 @@ class _AsyncUDPTracker:
             self._send_error(trans_id, "Invalid key (private tracker)", addr)
             return
 
-        # 客户端地址处理：
-        # 1. 规范化对端地址（IPv4-mapped IPv6 -> IPv4）
-        # 2. 按规范化后的地址判断 family
-        # 3. BEP 15: IPv4 client 可通过 ip_raw 声明自己的 IP；IPv6 client 的 ip_raw 必须为 0
+        # BEP 15: peer 列表格式由 UDP 包地址族决定，normalize 之前判断
         raw_client = addr[0]
+        client_is_v6 = ":" in raw_client
         normalized_client = _normalize_ip(raw_client)
-        client_is_v6 = ":" in normalized_client
 
+        # BEP 15: IPv4 地址字段仅在 IPv4 上下文中有效（32 位）
         if not client_is_v6 and ip_raw != 0:
             try:
                 client_ip = socket.inet_ntoa(struct.pack("!I", ip_raw))
@@ -984,73 +995,54 @@ class _AsyncUDPTracker:
             client_ip = normalized_client
 
         event_str = UDP_EVENT_MAP.get(event)
-        # BEP 15: numwant=-1 表示"尽可能多的 peer"，应映射到 MAX_NUMWANT
-        if numwant == -1:
+        # BEP 15: numwant 为无符号 32 位整数，但 struct 以有符号 'i' 解包。
+        # 值 > 2^31-1 会被解释为负数，需转换为无符号。
+        if numwant < 0:
+            numwant += 0x100000000
+        if numwant == 0 or numwant > MAX_NUMWANT:
             numwant = MAX_NUMWANT
-        elif numwant < 0:
-            numwant = 0
-        numwant = min(numwant, MAX_NUMWANT)
 
-        # 直接调用同步 Tracker（操作极快，避免线程池切换）
-        stats, peers = self.tracker.announce(
-            info_hash,
-            peer_id,
-            client_ip,
-            port,
-            uploaded,
-            downloaded,
-            left,
-            event_str,
-            numwant,
+        stats, peers = await self.tracker.announce(
+            info_hash, peer_id, client_ip, port,
+            uploaded, downloaded, left, event_str, numwant,
         )
 
         interval = INTERVAL
         leechers = min(stats["incomplete"], UINT32_MAX)
         seeders = min(stats["complete"], UINT32_MAX)
 
-        # 计算 UDP 响应中 peer 数据的最大字节数（避免 IP 分片）
-        peer_entry_size = 18 if client_is_v6 else 6
+        if client_is_v6:
+            same_family = [p for p in peers if ":" in _normalize_ip(p.ip)]
+            peer_entry_size = 18
+        else:
+            same_family = [p for p in peers if ":" not in _normalize_ip(p.ip)]
+            peer_entry_size = 6
+
         max_peer_bytes = max(0, UDP_MTU - UDP_ANNOUNCE_HDR_SIZE)
         max_peers_by_mtu = max_peer_bytes // peer_entry_size
 
-        # 先随机打乱/采样，再按 MTU 截断，确保每个客户端得到随机子集（BEP 15 建议）
-        if len(peers) > max_peers_by_mtu:
-            peers = random.sample(peers, max_peers_by_mtu)
+        if len(same_family) > max_peers_by_mtu:
+            same_family = random.sample(same_family, max_peers_by_mtu)
         else:
-            random.shuffle(peers)
+            random.shuffle(same_family)
 
-        # 根据客户端地址族编码 peer 列表（BEP 15 附录：格式由 UDP 包地址族决定）
-        if client_is_v6:
-            parts: list[bytes] = []
-            for p in peers:
-                ip = _normalize_ip(p.ip)
-                if ":" not in ip:
-                    continue
-                try:
-                    packed = socket.inet_pton(socket.AF_INET6, ip)
-                    parts.append(COMPACT6_STRUCT.pack(packed, p.port))
-                except OSError:
-                    continue
-            peer_blob = b"".join(parts)
-        else:
-            parts = []
-            for p in peers:
-                ip = _normalize_ip(p.ip)
-                if ":" in ip:
-                    continue
-                try:
-                    packed = socket.inet_pton(socket.AF_INET, ip)
-                    parts.append(COMPACT4_STRUCT.pack(packed, p.port))
-                except OSError:
-                    continue
-            peer_blob = b"".join(parts)
+        parts: list[bytes] = []
+        packer = COMPACT6_STRUCT if client_is_v6 else COMPACT4_STRUCT
+        af = socket.AF_INET6 if client_is_v6 else socket.AF_INET
+        for p in same_family:
+            ip = _normalize_ip(p.ip)
+            try:
+                packed = socket.inet_pton(af, ip)
+                parts.append(packer.pack(packed, p.port))
+            except OSError:
+                continue
+        peer_blob = b"".join(parts)
 
         response = UDP_ANNOUNCE_HEADER.pack(
             ACTION_ANNOUNCE, trans_id, interval, leechers, seeders
         ) + peer_blob
         self._sendto(response, addr)
 
-    # ---- Scrape ----
     async def _handle_scrape(
         self, data: bytes, trans_id: int, addr: tuple[Any, ...]
     ) -> None:
@@ -1069,15 +1061,13 @@ class _AsyncUDPTracker:
 
         count = payload_len // 20
         if count == 0:
-            self._sendto(
-                UDP_SCRAPE_HEADER.pack(ACTION_SCRAPE, trans_id), addr
-            )
+            self._sendto(UDP_SCRAPE_HEADER.pack(ACTION_SCRAPE, trans_id), addr)
             return
         if count > MAX_SCRAPE_HASHES:
             count = MAX_SCRAPE_HASHES
 
         hashes = [data[16 + i * 20 : 16 + (i + 1) * 20] for i in range(count)]
-        files = self.tracker.scrape(hashes)
+        files = await self.tracker.scrape(hashes)
 
         parts: list[bytes] = [UDP_SCRAPE_HEADER.pack(ACTION_SCRAPE, trans_id)]
         for ih in hashes:
@@ -1104,21 +1094,18 @@ class _AsyncUDPTracker:
 
 
 # ---------------------------------------------------------------------------
-# Flask 应用
+# aiohttp 路由
 # ---------------------------------------------------------------------------
-app = Flask(__name__)
+routes = web.RouteTableDef()
 tracker = Tracker()
-shutdown_event = threading.Event()
-_server_instance: BaseWSGIServer | None = None
-_udp_transport: asyncio.DatagramTransport | None = None
-_udp_loop: asyncio.AbstractEventLoop | None = None
-_udp_stop_signal: Any = None
-_udp_thread: threading.Thread | None = None
 _start_time = time.time()
 
+_shutdown_event = asyncio.Event()
+_udp_transport: asyncio.DatagramTransport | None = None
 
-@app.route("/")
-def index() -> Response:
+
+@routes.get("/")
+async def index(request: web.Request) -> web.Response:
     return _json_response(
         {
             "status": "ok",
@@ -1134,10 +1121,13 @@ def index() -> Response:
     )
 
 
-@app.route("/announce")
-def announce() -> Response:
+@routes.get("/announce")
+async def announce(request: web.Request) -> web.Response:
     try:
-        qs = request.query_string
+        # BEP 3: info_hash/peer_id 为 20 字节二进制数据，客户端以 %XX 百分号编码传输。
+        # 必须使用 raw_query_string（保留 %XX 编码），而非 query_string（已被
+        # aiohttp/yarl 做 UTF-8 解码，二进制数据会产生 surrogate 字符导致编码崩溃）。
+        qs = request.rel_url.raw_query_string.encode("ascii")
         parsed_qs = _parse_query_string_raw(qs)
 
         auth_err = _check_announce_key(parsed_qs)
@@ -1152,13 +1142,13 @@ def announce() -> Response:
         if err:
             return err
         if not port_bytes:
-            return _bencode_error("Missing port", 400)
+            return _bencode_error("Missing port")
         try:
             port = int(port_bytes)
             if port < 1 or port > 65535:
-                return _bencode_error("Invalid port", 400)
+                return _bencode_error("Invalid port")
         except (ValueError, TypeError):
-            return _bencode_error("Invalid port", 400)
+            return _bencode_error("Invalid port")
 
         uploaded = _get_int(parsed_qs, "uploaded", 0)
         downloaded = _get_int(parsed_qs, "downloaded", 0)
@@ -1171,7 +1161,7 @@ def announce() -> Response:
             try:
                 numwant = int(numwant_bytes)
             except (ValueError, TypeError):
-                return _bencode_error("Invalid numwant parameter", 400)
+                return _bencode_error("Invalid numwant parameter")
             if numwant == -1:
                 numwant = MAX_NUMWANT
             elif numwant < 0:
@@ -1183,11 +1173,9 @@ def announce() -> Response:
         if event is not None and event not in VALID_EVENTS:
             event = None
 
-        compact_bytes = _get_first(parsed_qs, "compact")
-        # BEP 23: compact=1 显式启用 compact 模式；默认返回非 compact 列表
-        compact = compact_bytes == b"1"
+        # BEP 23: compact 参数兼容 "1"/"true"
+        compact = _is_truthy(_get_first(parsed_qs, "compact"))
 
-        # BEP 7: 客户端可声明自己的 IP
         ip_param_bytes = _get_first(parsed_qs, "ip")
         if ip_param_bytes:
             ip_param = ip_param_bytes.decode("ascii", errors="replace")
@@ -1199,12 +1187,12 @@ def announce() -> Response:
         if ip_param is not None and (ALLOW_PRIVATE_IP or not _is_private_ip(ip_param)):
             ip = _normalize_ip(ip_param)
         else:
-            ip = _get_client_ip_from_request()
+            ip = _get_client_ip(request)
 
         if not _is_valid_ip(ip):
             ip = "127.0.0.1"
 
-        stats, peers = tracker.announce(
+        stats, peers = await tracker.announce(
             info_hash=info_hash,
             peer_id=peer_id,
             ip=ip,
@@ -1216,7 +1204,7 @@ def announce() -> Response:
             numwant=numwant,
         )
 
-        # BEP 3 响应字段
+        # BEP 3: 所有 key 使用 bytes，bencodepy 编码更可靠
         response_data: dict[bytes, Any] = {
             b"interval": INTERVAL,
             b"min interval": MIN_INTERVAL,
@@ -1226,29 +1214,32 @@ def announce() -> Response:
         }
 
         if compact:
-            # BEP 7：peers 固定为 IPv4 compact；peers6 为 IPv6 compact
             v4_blob, v6_blob = _encode_compact_peers(peers)
             response_data[b"peers"] = v4_blob
             if v6_blob:
                 response_data[b"peers6"] = v6_blob
         else:
+            # BEP 3 非 compact: peer id/ip/port，统一 bytes key
             response_data[b"peers"] = [
-                {b"peer id": p.peer_id, b"ip": _normalize_ip(p.ip), b"port": p.port}
+                {
+                    b"peer id": p.peer_id,
+                    b"ip": _normalize_ip(p.ip).encode("ascii"),
+                    b"port": p.port,
+                }
                 for p in peers
             ]
 
-        return Response(bencodepy.encode(response_data), mimetype="text/plain")
+        return _bencode_response(response_data)
     except Exception:
         logger.exception("Announce 处理错误")
-        return _bencode_error("Internal tracker error", 500)
+        return _bencode_error("Internal tracker error")
 
 
-@app.route("/scrape")
-@app.route("/scrape/", defaults={"extra": ""})
-@app.route("/scrape/<path:extra>")
-def scrape(extra: str = "") -> Response:
+@routes.get("/scrape")
+async def scrape(request: web.Request) -> web.Response:
     try:
-        qs = request.query_string
+        # 同 announce：使用 raw_query_string 保留 %XX 百分号编码
+        qs = request.rel_url.raw_query_string.encode("ascii")
         parsed_qs = _parse_query_string_raw(qs)
 
         auth_err = _check_scrape_key(parsed_qs)
@@ -1257,14 +1248,16 @@ def scrape(extra: str = "") -> Response:
 
         info_hashes = list(_get_all(parsed_qs, "info_hash"))
 
+        extra = request.match_info.get("extra", "")
         if extra:
             for chunk in extra.strip("/").split("/"):
                 chunk = chunk.strip()
-                if len(chunk) == 40 and _HEX_RE.match(chunk.encode("ascii")):
-                    info_hashes.append(chunk.encode("ascii"))
+                chunk_bytes = chunk.encode("ascii")
+                if len(chunk_bytes) == 40 and _HEX_RE.match(chunk_bytes):
+                    info_hashes.append(chunk_bytes)
 
         if not info_hashes:
-            return _bencode_error("Missing info_hash", 400)
+            return _bencode_error("Missing info_hash")
 
         seen: set[bytes] = set()
         unique: list[bytes] = []
@@ -1278,11 +1271,11 @@ def scrape(extra: str = "") -> Response:
             unique.append(norm)
 
         if not unique:
-            return _bencode_error("No valid info_hash", 400)
+            return _bencode_error("No valid info_hash")
         if len(unique) > MAX_SCRAPE_HASHES:
             unique = unique[:MAX_SCRAPE_HASHES]
 
-        files = tracker.scrape(unique)
+        files = await tracker.scrape(unique)
         http_files: dict[bytes, dict[bytes, int]] = {}
         for ih, s in files.items():
             http_files[ih] = {
@@ -1290,31 +1283,29 @@ def scrape(extra: str = "") -> Response:
                 b"downloaded": s[b"completed"],
                 b"incomplete": s[b"leechers"],
             }
-        return Response(
-            bencodepy.encode({b"files": http_files}), mimetype="text/plain"
-        )
+        return _bencode_response({b"files": http_files})
     except Exception:
         logger.exception("Scrape 处理错误")
-        return _bencode_error("Internal tracker error", 500)
+        return _bencode_error("Internal tracker error")
 
 
-@app.route("/add_torrent_info", methods=["POST"])
-def add_torrent_info() -> Response:
-    auth = _check_api_key_header()
+@routes.post("/add_torrent_info")
+async def add_torrent_info(request: web.Request) -> web.Response:
+    auth = _check_api_key(request)
     if auth:
         return auth
     try:
-        data = request.get_json(silent=True) or {}
+        if request.content_length and request.content_length > MAX_HTTP_BODY_SIZE:
+            return _json_error("Request body too large", status=413)
+        data = await request.json()
         if "info_hash" not in data:
-            return _json_response({"error": "Missing info_hash"}, status=400)
+            return _json_error("Missing info_hash")
         try:
             info_hash = hex_to_bytes(str(data["info_hash"]))
             if len(info_hash) != 20:
-                return _json_response(
-                    {"error": "info_hash must be 20 bytes"}, status=400
-                )
+                return _json_error("info_hash must be 20 bytes")
         except Exception:
-            return _json_response({"error": "Invalid info_hash hex"}, status=400)
+            return _json_error("Invalid info_hash hex")
 
         allowed_fields = {"name", "size", "piece_length", "comment", "created_by"}
         update_data: dict[str, Any] = {}
@@ -1329,11 +1320,9 @@ def add_torrent_info() -> Response:
                     try:
                         update_data[field] = int(val) if val is not None else 0
                     except (ValueError, TypeError):
-                        return _json_response(
-                            {"error": f"Invalid value for field {field}"}, status=400
-                        )
+                        return _json_error(f"Invalid value for field {field}")
 
-        with tracker.lock:
+        async with tracker.lock:
             info = tracker.torrent_info.get(info_hash)
             if info is not None:
                 for field, value in update_data.items():
@@ -1355,32 +1344,32 @@ def add_torrent_info() -> Response:
         return _json_response({"status": "ok"})
     except Exception:
         logger.exception("add_torrent_info 错误")
-        return _json_response({"error": "Internal error"}, status=500)
+        return _json_error("Internal error", status=500)
 
 
-@app.route("/stats")
-def get_all_stats() -> Response:
-    auth = _check_api_key_header()
+@routes.get("/stats")
+async def get_all_stats(request: web.Request) -> web.Response:
+    auth = _check_api_key(request)
     if auth:
         return auth
     try:
-        return _json_response(tracker.get_all_stats(), indent=2)
+        return _json_response(await tracker.get_all_stats(), indent=2)
     except Exception:
         logger.exception("stats 错误")
-        return _json_response({"error": "Internal error"}, status=500)
+        return _json_error("Internal error", status=500)
 
 
-@app.route("/save_state", methods=["POST"])
-def save_state() -> Response:
-    auth = _check_api_key_header()
+@routes.post("/save_state")
+async def save_state(request: web.Request) -> web.Response:
+    auth = _check_api_key(request)
     if auth:
         return auth
-    tracker.save_state()
+    await tracker.save_state()
     return _json_response({"status": "ok", "message": "Tracker 状态已保存"})
 
 
-@app.route("/health")
-def health() -> Response:
+@routes.get("/health")
+async def health(request: web.Request) -> web.Response:
     return _json_response(
         {
             "status": "ok",
@@ -1392,62 +1381,45 @@ def health() -> Response:
     )
 
 
-@app.route("/shutdown", methods=["POST"])
-def shutdown() -> Response:
-    auth = _check_api_key_header()
+@routes.post("/shutdown")
+async def shutdown(request: web.Request) -> web.Response:
+    auth = _check_api_key(request)
     if auth:
         return auth
-    if not shutdown_event.is_set():
-        shutdown_event.set()
-    if _server_instance is not None:
-        threading.Thread(target=_server_instance.shutdown, daemon=True).start()
-    _notify_udp_shutdown()
+    if not _shutdown_event.is_set():
+        _shutdown_event.set()
     return _json_response({"status": "shutting down"})
 
 
 # ---------------------------------------------------------------------------
-# 信号处理与自动保存
+# 信号与自动保存
 # ---------------------------------------------------------------------------
-def _notify_udp_shutdown() -> None:
-    """线程安全地通知 UDP 事件循环关闭。"""
-    global _udp_stop_signal, _udp_loop
-    sig = _udp_stop_signal
-    loop = _udp_loop
-    if sig is not None and loop is not None and loop.is_running():
-        loop.call_soon_threadsafe(sig)
-
-
 def signal_handler(signum: int, frame: object) -> None:
     logger.info("收到信号 %d，正在关闭...", signum)
-    if not shutdown_event.is_set():
-        shutdown_event.set()
-        if _server_instance is not None:
-            threading.Thread(target=_server_instance.shutdown, daemon=True).start()
-        _notify_udp_shutdown()
+    if not _shutdown_event.is_set():
+        _shutdown_event.set()
 
 
-def auto_save_loop() -> None:
-    while not shutdown_event.is_set():
-        shutdown_event.wait(AUTO_SAVE_INTERVAL)
-        if not shutdown_event.is_set():
-            try:
-                tracker.save_state()
-            except Exception:
-                logger.exception("自动保存失败")
+async def _auto_save_loop() -> None:
+    while not _shutdown_event.is_set():
+        try:
+            await asyncio.wait_for(_shutdown_event.wait(), timeout=AUTO_SAVE_INTERVAL)
+            break
+        except asyncio.TimeoutError:
+            pass
+        try:
+            await tracker.save_state()
+        except Exception:
+            logger.exception("自动保存失败")
 
 
 # ---------------------------------------------------------------------------
-# 异步 UDP 服务器启动
+# UDP 服务器启动
 # ---------------------------------------------------------------------------
-async def _start_udp_server(host: str, port: int) -> _AsyncUDPTracker:
-    """启动异步 UDP tracker 服务器。"""
+async def _setup_udp_server(host: str, port: int) -> _AsyncUDPTracker:
     loop = asyncio.get_running_loop()
-    global _udp_loop, _udp_stop_signal
-    _udp_loop = loop
-
     sock = _create_udp_socket(host, port)
-
-    protocol = _AsyncUDPTracker(host, port, tracker)
+    protocol = _AsyncUDPTracker(host, port, tracker, _shutdown_event)
 
     transport, _ = await loop.create_datagram_endpoint(
         lambda: protocol,
@@ -1456,56 +1428,14 @@ async def _start_udp_server(host: str, port: int) -> _AsyncUDPTracker:
     global _udp_transport
     _udp_transport = transport
 
-    logger.info(
-        "UDP Tracker 监听于 %s:%d（asyncio 模式，无线程池）",
-        host, port,
-    )
+    logger.info("UDP Tracker 监听于 %s:%d（asyncio 模式）", host, port)
     if protocol._key_required:
         logger.info("UDP Tracker 已启用 API Key 验证（私有模式）")
-
-    # 启动连接清理任务
-    cleanup_task = asyncio.create_task(protocol._cleanup_connections_loop())
-
-    # 使用 asyncio.Event 实现即时关闭通知
-    udp_stop_event = asyncio.Event()
-
-    def _signal_udp_stop() -> None:
-        if not udp_stop_event.is_set():
-            udp_stop_event.set()
-
-    global _udp_stop_signal
-    _udp_stop_signal = _signal_udp_stop
-
-    try:
-        # 兜底轮询：主路径通过 _notify_udp_shutdown -> call_soon_threadsafe 即时触发
-        async def _poll_shutdown() -> None:
-            while not shutdown_event.is_set():
-                await asyncio.sleep(1.0)
-            _signal_udp_stop()
-
-        poll_task = asyncio.create_task(_poll_shutdown())
-        await udp_stop_event.wait()
-        poll_task.cancel()
-        try:
-            await poll_task
-        except (asyncio.CancelledError, Exception):
-            pass
-    finally:
-        cleanup_task.cancel()
-        transport.close()
-        try:
-            await asyncio.gather(cleanup_task, return_exceptions=True)
-        except Exception:
-            pass
-        _udp_transport = None
-        _udp_loop = None
-        _udp_stop_signal = None
 
     return protocol
 
 
 def _create_udp_socket(host: str, port: int) -> socket.socket:
-    """创建 UDP socket（支持双栈）。"""
     sock = _try_create_v6_dual(host, port)
     if sock is not None:
         return sock
@@ -1519,7 +1449,7 @@ def _try_create_v6_dual(host: str, port: int) -> socket.socket | None:
             family = socket.AF_INET6
             bind = (host, port)
         elif isinstance(addr, ipaddress.IPv4Address) and str(addr) != "0.0.0.0":
-            return None  # 显式 IPv4 -> 走 v4
+            return None
         else:
             family = socket.AF_INET6
             bind = ("::", port)
@@ -1570,39 +1500,24 @@ def _create_v4(host: str, port: int) -> socket.socket:
     return sock
 
 
-def run_async_udp(host: str, port: int) -> None:
-    """在新线程中运行 asyncio 事件循环。"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(_start_udp_server(host, port))
-    except Exception:
-        logger.exception("UDP 事件循环异常")
-    finally:
-        pending = asyncio.all_tasks(loop)
-        if pending:
-            for task in pending:
-                task.cancel()
-            loop.run_until_complete(
-                asyncio.gather(*pending, return_exceptions=True)
-            )
-        loop.close()
+# ---------------------------------------------------------------------------
+# 主入口
+# ---------------------------------------------------------------------------
+async def _main() -> None:
+    await tracker.initialize()
+    udp_protocol = await _setup_udp_server(IP, UDP_PORT)
 
+    app = web.Application(client_max_size=MAX_HTTP_BODY_SIZE)
+    app.add_routes(routes)
+    # 统一路由：/scrape 与 /scrape/<hash>
+    app.router.add_get("/scrape/{extra:.*}", scrape)
 
-def run_server() -> None:
-    global _server_instance, _udp_thread
-    srv = make_server(IP, PORT, app, threaded=True)
-    _server_instance = srv
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, IP, PORT)
+    await site.start()
 
-    # 在独立线程中启动 asyncio UDP 服务器（非 daemon，确保干净退出）
-    udp_thread = threading.Thread(
-        target=run_async_udp, args=(IP, UDP_PORT),
-        daemon=False, name="udp-asyncio"
-    )
-    _udp_thread = udp_thread
-    udp_thread.start()
-
-    logger.info("Tracker 服务端运行于 %s:%d (TCP+UDP，UDP 使用 asyncio)", IP, PORT)
+    logger.info("Tracker 服务端运行于 %s:%d (TCP+UDP，统一 asyncio 事件循环)", IP, PORT)
     if API_KEY:
         logger.info("管理端点已启用 API 密钥认证")
         if PROTECT_ANNOUNCE:
@@ -1611,44 +1526,30 @@ def run_server() -> None:
             logger.info("Scrape 端点已启用 API Key 保护（私有模式）")
     else:
         logger.warning("API 密钥未设置，管理端点不受保护！")
-    try:
-        srv.serve_forever()
-    finally:
-        if not shutdown_event.is_set():
-            shutdown_event.set()
-        _notify_udp_shutdown()
-        logger.info("服务端已关闭")
+
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(udp_protocol._cleanup_connections_loop())
+        tg.create_task(tracker._cleanup_loop())
+        tg.create_task(_auto_save_loop())
+        await _shutdown_event.wait()
+
+    # 通知所有后台任务停止
+    await tracker.stop()
+
+    await runner.cleanup()
+    if _udp_transport is not None:
+        _udp_transport.close()
+    await tracker.save_state()
+    logger.info("Tracker 已停止。")
 
 
-# ---------------------------------------------------------------------------
-# 程序入口
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    server_thread = threading.Thread(
-        target=run_server, daemon=False, name="http-server"
-    )
-    server_thread.start()
-
-    save_thread = threading.Thread(
-        target=auto_save_loop, daemon=True, name="auto-save"
-    )
-    save_thread.start()
-
     try:
-        while server_thread.is_alive():
-            server_thread.join(1)
+        asyncio.run(_main())
     except KeyboardInterrupt:
-        signal_handler(signal.SIGINT, None)
+        pass
     finally:
-        logger.info("正在关闭 Tracker...")
-        tracker.stop()
-        if server_thread.is_alive():
-            server_thread.join(timeout=5)
-        if _udp_thread is not None and _udp_thread.is_alive():
-            _udp_thread.join(timeout=5)
-        tracker.save_state()
-        logger.info("Tracker 已停止。")
-        sys.exit(0)
+        logger.info("进程退出。")

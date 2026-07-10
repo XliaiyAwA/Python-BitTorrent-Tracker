@@ -125,7 +125,7 @@
 ### 1. 安装依赖
 
 ```bash
-pip install bencodepy orjson flask werkzeug
+pip install bencodepy orjson aiohttp werkzeug
 ```
 
 ### 2. 启动服务
@@ -351,7 +351,7 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # 安装依赖
-RUN pip install --no-cache-dir bencodepy orjson flask werkzeug
+RUN pip install --no-cache-dir bencodepy orjson aiohttp werkzeug
 
 # 复制代码
 COPY tracker.py .
