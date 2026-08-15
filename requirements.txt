@@ -1,4 +1,3 @@
 bencodepy
-werkzeug
 aiohttp
 orjson

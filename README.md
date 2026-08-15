@@ -1,17 +1,9 @@
 # Python-BitTorrent-Tracker
 
-一个高性能、内存型的 BitTorrent Tracker 服务端，同时支持 HTTP 和 UDP 协议，严格遵循 BitTorrent 协议规范。
+一个高性能、内存型的 BitTorrent Tracker 服务端，同时支持 HTTP 和 UDP 协议，严格遵循 BitTorrent 协议规范。支持 TOML 配置文件 + 环境变量双重配置方式，使用 SQLite 作为持久化存储（Write-Behind 异步批量落库），兼容旧版 JSON 状态文件自动迁移。
 
 ## 目录
 
-- [功能特性](#功能特性)
-  - [双协议支持](#双协议支持)
-  - [双栈网络支持](#双栈网络支持)
-  - [高性能设计](#高性能设计)
-  - [状态持久化](#状态持久化)
-  - [安全特性](#安全特性)
-  - [可观测性](#可观测性)
-  - [管理功能](#管理功能)
 - [环境需求](#环境需求)
 - [快速开始](#快速开始)
   - [1. 安装依赖](#1-安装依赖)
@@ -69,71 +61,14 @@
   - [BEP 15 兼容细节](#bep-15-兼容细节)
 - [注意事项](#注意事项)
 
----
-
-## 功能特性
-
-### 双协议支持
-- **HTTP Tracker**：基于 aiohttp 异步框架实现，完整支持 BEP 3 规范，同时支持 compact（BEP 23）和非 compact 两种 peer 列表格式
-- **UDP Tracker**：基于 asyncio 协程实现 BEP 15 协议，无线程池设计，高并发下性能优异
-
-### 双栈网络支持
-- 原生支持 IPv4 和 IPv6
-- 自动处理 IPv4-mapped IPv6、6to4、Teredo 等特殊地址格式
-- 默认尝试 IPv6 双栈监听，失败自动回退到 IPv4
-- UDP 接收缓冲区设置为 8MB，应对突发流量
-
-### 高性能设计
-- 基于 aiohttp + asyncio 全异步架构，HTTP 和 UDP 共享同一事件循环，使用 `asyncio.TaskGroup` 管理后台任务
-- 纯内存存储，读写操作均在内存完成
-- 使用 asyncio 原生异步锁保证并发安全
-- 统计信息 10 秒缓存，减少重复计算
-- UDP 响应严格限制 MTU 为 1400 字节，避免 IP 分片
-- Peer 列表使用 `secrets.SystemRandom` 加密安全随机采样返回，符合 BEP 15 建议
-- UDP 处理使用信号量限制并发数（默认 256），防止高并发下内存溢出
-- 内置 per-IP 速率限制（HTTP Token Bucket + UDP 双 Token Bucket），通过 LRU 有序字典高效管理
-
-### 状态持久化
-- 自动定期保存状态到 JSON 文件（默认 300 秒）
-- 临时文件 + 原子替换（`os.replace`）写入，保证文件完整性
-- 启动时自动加载历史状态，过期 peer 自动过滤
-- 损坏记录自动跳过，单条失败不影响整体加载
-- 损坏的状态文件自动备份（`.corrupt.<timestamp>` 后缀），防止数据丢失
-- 优雅关闭时自动保存状态
-
-### 安全特性
-- 可选 API 密钥认证，管理端点默认受保护
-- 支持私有 Tracker 模式（announce/scrape 需要 key 验证）
-- 可配置是否允许私有 IP 地址接入
-- 反向代理支持（自动识别 `X-Forwarded-For` / `X-Real-IP` 头）
-- 常量时间字符串比较（`hmac.compare_digest`），防止时序攻击
-- UDP 连接 ID 使用 `secrets.randbits(64)` 生成，有效期 2 分钟且不刷新，防止放大攻击
-- UDP 协议内置双 Token Bucket 速率限制，有效防御 DDoS/反射放大攻击
-- HTTP 协议内置 Token Bucket 速率限制，防止 HTTP announce/scrape 滥用
-- UDP 连接表 LRU 淘汰机制，防止内存溢出
-- 异常包静默丢弃策略，被限速请求不响应任何数据
-
-### 可观测性
-- 内置 Prometheus 风格指标收集器（`/metrics` 端点），无需额外依赖
-- 指标涵盖：活跃种子数、peer 数、UDP 连接数、announce/scrape 请求计数（按协议和成功/失败）、速率限制命中次数、请求延迟统计
-- 健康检查端点，方便接入监控系统
-
-### 管理功能
-- 查询所有种子的详细统计信息（名称、大小、做种数、下载数、累计流量等）
-- 手动触发状态保存
-- 优雅关闭服务（支持 SIGINT/SIGTERM 信号）
-- 支持通过 API 添加/更新种子元数据
-- 自动清理孤儿元数据（无活跃 peer 且无意义的种子信息）
-
----
-
 ## 环境需求
 
 | 项目 | 要求 |
 |------|------|
-| Python 版本 | **3.11 及以上**（使用 `asyncio.TaskGroup`） |
+| Python 版本 | **3.11 及以上**（使用 `asyncio.TaskGroup`、`tomllib`） |
 | 操作系统 | Linux（推荐）、macOS、Windows（部分功能有限制） |
 | 依赖包 | `bencodepy`、`orjson`、`aiohttp` |
+| 配置文件 | 可选：`tracker.toml`（与 `tracker.py` 同目录） |
 | 网络 | 需要开放 TCP 和 UDP 对应端口（默认 6969） |
 
 ---
@@ -194,7 +129,7 @@ source venv/bin/activate
 export TRACKER_API_KEY="your-secret-key-change-this"
 export TRACKER_PORT=6969
 export TRACKER_UDP_PORT=6969
-export DATA_FILE="/opt/bittorrent-tracker/data/tracker_state.json"
+export TRACKER_DB_FILE="/opt/bittorrent-tracker/data/tracker_state.db"
 export PEER_TIMEOUT=1800
 export AUTO_SAVE_INTERVAL=300
 export LOG_LEVEL="INFO"
@@ -267,7 +202,8 @@ TRACKER_INTERVAL=1800
 PEER_TIMEOUT=1800
 
 # 存储配置
-DATA_FILE=/opt/bittorrent-tracker/data/tracker_state.json
+TRACKER_DB_FILE=/opt/bittorrent-tracker/data/tracker_state.db
+TRACKER_DB_FLUSH_INTERVAL=3
 AUTO_SAVE_INTERVAL=300
 CLEANUP_INTERVAL=120
 
@@ -400,7 +336,7 @@ RUN mkdir -p /data
 ENV TRACKER_IP=0.0.0.0 \
     TRACKER_PORT=6969 \
     TRACKER_UDP_PORT=6969 \
-    DATA_FILE=/data/tracker_state.json \
+    TRACKER_DB_FILE=/data/tracker_state.db \
     LOG_LEVEL=INFO \
     TRACKER_ALLOW_PRIVATE_IP=false \
     TRACKER_BEHIND_PROXY=false
@@ -560,7 +496,24 @@ BitTorrent 客户端对 HTTPS Tracker 的支持并不统一，**建议 announce 
 
 ## 配置详解
 
-所有配置均通过环境变量设置，无需修改源码。
+所有配置均通过 TOML 配置文件（`tracker.toml`）或环境变量设置，环境变量优先级更高。无需修改源码。
+
+### TOML 配置文件
+
+服务启动时会自动查找当前目录或 `tracker.py` 所在目录下的 `tracker.toml` 文件。所有配置项均可在 TOML 中设置，键名与环境变量名一致。示例：
+
+```toml
+# tracker.toml
+TRACKER_IP = "0.0.0.0"
+TRACKER_PORT = 6969
+TRACKER_API_KEY = "your-secret-key"
+LOG_LEVEL = "INFO"
+PEER_TIMEOUT = 1800
+TRACKER_DB_FILE = "tracker_state.db"
+TRACKER_DB_FLUSH_INTERVAL = 3
+```
+
+若 TOML 文件不存在或解析失败，服务会回退到默认值/环境变量并记录警告日志。
 
 ### 监听地址与端口
 
@@ -586,11 +539,19 @@ BitTorrent 客户端对 HTTPS Tracker 的支持并不统一，**建议 announce 
 
 ### 数据存储配置
 
+Tracker 使用 SQLite 作为主存储（WAL 模式，Write-Behind 异步批量落库），内存读写、SQLite 持久化。启动时若 SQLite 为空，会自动从旧版 `tracker_state.json` 一次性迁移。
+
 | 环境变量 | 默认值 | 说明 |
 |---------|--------|------|
-| `DATA_FILE` | `tracker_state.json` | 状态持久化文件路径，建议使用绝对路径 |
-| `AUTO_SAVE_INTERVAL` | `300` | 自动保存间隔（秒），默认 5 分钟 |
+| `TRACKER_DB_FILE` | `tracker_state.db` | SQLite 数据库文件路径，建议使用绝对路径 |
+| `TRACKER_DATA_FILE` / `DATA_FILE` | `tracker_state.json` | 旧版 JSON 状态文件路径（仅用于一次性迁移，不再作为主存储） |
+| `TRACKER_DB_FLUSH_INTERVAL` | `3` | SQLite 异步批量落库间隔（秒），默认 3 秒 |
+| `TRACKER_DB_FLUSH_BATCH` | `5000` | SQLite 单次批量落库最大行数 |
+| `AUTO_SAVE_INTERVAL` | `300` | 强制落库 + WAL checkpoint 间隔（秒），默认 5 分钟 |
 | `CLEANUP_INTERVAL` | `120` | 过期 peer 清理间隔（秒），默认 2 分钟 |
+| `TRACKER_DB_STATS_HISTORY` | `true` | 是否启用 stats_history 表（定期采样种子计数，用于事后趋势分析） |
+| `TRACKER_STATS_HISTORY_INTERVAL` | `60` | stats_history 采样间隔（秒），默认 60 秒 |
+| `TRACKER_STATS_HISTORY_RETENTION` | `604800` | stats_history 数据保留时间（秒），默认 7 天 |
 
 ### 容量限制配置
 
@@ -602,8 +563,17 @@ BitTorrent 客户端对 HTTPS Tracker 的支持并不统一，**建议 announce 
 | `MAX_UDP_CONNECTIONS` | `100000` | UDP 连接表最大条目数，采用 LRU 策略自动淘汰最久未使用的连接 |
 | `MAX_UDP_PACKET_SIZE` | `4096` | UDP 单个数据包最大字节数，超过此大小的包直接丢弃 |
 | `MAX_HTTP_BODY_SIZE` | `65536` | HTTP 请求体最大字节数（64KB），用于 `/add_torrent_info` 等 POST 接口 |
+| `MAX_SCRAPE_HASHES` | `74` | 单次 scrape 请求最多查询的 info_hash 数量 |
 
-> **注意：** `MAX_SCRAPE_HASHES` 已硬编码为 74，不再通过环境变量配置。单次 scrape 请求最多查询 74 个 info_hash。
+### 防 info_hash 洪水配置
+
+基于 per-IP Token Bucket 限制新种子的创建频率，防止恶意客户端通过大量随机 info_hash 耗尽内存。
+
+| 环境变量 | 默认值 | 说明 |
+|---------|--------|------|
+| `TRACKER_NEW_HASH_BURST` | `20` | 突发允许的新种子创建数（burst 容量） |
+| `TRACKER_NEW_HASH_PER_HOUR` | `40` | 每小时允许的新种子创建数（补充速率） |
+| `TRACKER_NEW_HASH_MAX_ENTRIES` | `100000` | 洪水表最大条目数，超过时自动淘汰最旧条目 |
 
 ### 安全与认证配置
 
@@ -614,6 +584,7 @@ BitTorrent 客户端对 HTTPS Tracker 的支持并不统一，**建议 announce 
 | `TRACKER_PROTECT_SCRAPE` | `false` | 是否对 scrape 端点启用密钥保护 |
 | `TRACKER_ALLOW_PRIVATE_IP` | `true` | 是否接受来自私有 IP 地址（如 192.168.x.x、10.x.x.x、127.0.0.1 等）的 announce。公网部署建议设为 `false` |
 | `TRACKER_BEHIND_PROXY` | `false` | 是否部署在反向代理之后。设为 `true` 时会从 `X-Forwarded-For` 或 `X-Real-IP` 头获取真实客户端 IP |
+| `TRACKER_ALLOW_IP_PARAM` | `false` | 是否信任 HTTP announce 的 `ip` 查询参数。默认关闭以防止伪造 IP 污染 swarm |
 
 ### UDP 协议配置
 
@@ -644,6 +615,7 @@ HTTP 层面同样内置 Token Bucket 速率限制，对 `/announce` 和 `/scrape
 | `HTTP_RATE_LIMIT_ENABLED` | `true` | 是否启用 HTTP 速率限制 |
 | `HTTP_RATE_LIMIT_RPS` | `20` | 每个 IP 每秒允许的最大 HTTP 请求数 |
 | `HTTP_RATE_LIMIT_BURST` | `50` | 突发流量允许的最大请求数（burst 容量） |
+| `HTTP_RATE_LIMIT_MAX_ENTRIES` | `200000` | 速率限制表最大条目数，超过时自动淘汰最旧条目 |
 
 ### 布尔值说明
 
@@ -702,6 +674,9 @@ Prometheus 格式指标端点，返回当前 Tracker 的运行指标，可直接
 - `tracker_rate_limit_hits_total`（counter）：速率限制命中次数
 - `tracker_request_duration_seconds_total`（counter，按 endpoint）：请求耗时累计
 - `tracker_request_duration_seconds_count`（counter，按 endpoint）：请求计数
+- `tracker_db_flush_total`（counter）：SQLite 落库操作总次数
+- `tracker_db_flush_errors_total`（counter）：SQLite 落库失败总次数
+- `tracker_db_flush_seconds_sum`（counter）：SQLite 落库累计耗时（秒）
 
 #### `GET /announce`
 BitTorrent HTTP announce 端点（BEP 3），这是 BT 客户端通信的核心端点。
@@ -716,7 +691,7 @@ BitTorrent HTTP announce 端点（BEP 3），这是 BT 客户端通信的核心�
 - `event`：事件类型，可选值：`started`、`stopped`、`completed`
 - `numwant`：请求返回的 peer 数量，默认 50，`-1` 表示尽可能多（受 `MAX_NUMWANT` 限制）
 - `compact`：设为 `1` 启用 compact 响应格式（BEP 23），推荐使用
-- `ip`：客户端声明自己的 IP（BEP 7），可选
+- `ip`：客户端声明自己的 IP（BEP 7），默认不信任（需设置 `TRACKER_ALLOW_IP_PARAM=true` 才启用）
 - `key`：私有 Tracker 模式下的认证密钥
 
 响应为 bencode 编码格式。
@@ -726,7 +701,7 @@ BitTorrent scrape 端点，用于批量查询种子统计信息。
 
 - `info_hash` 参数可重复指定，查询多个种子
 - URL 路径支持直接写十六进制 info_hash，多个用 `/` 分隔
-- 单次最多查询 74 个 info_hash（硬编码限制，用于控制响应大小）
+- 单次最多查询 `MAX_SCRAPE_HASHES` 个 info_hash（默认 74），可通过环境变量或 TOML 配置
 
 响应为 bencode 编码格式，包含每个种子的 `complete`（做种数）、`downloaded`（完成数）、`incomplete`（下载数）。
 
@@ -760,7 +735,7 @@ BitTorrent scrape 端点，用于批量查询种子统计信息。
 - `created_by`：创建者信息
 
 #### `GET /stats`
-查询所有种子的详细统计信息，返回 JSON 格式。
+查询所有种子的详细统计信息，通过 SQLite 聚合查询返回 JSON 格式。
 
 **响应示例结构：**
 ```json
@@ -788,7 +763,10 @@ BitTorrent scrape 端点，用于批量查询种子统计信息。
 - `peers`：当前活跃 peer 总数
 
 #### `POST /save_state`
-手动触发状态保存到磁盘，正常情况下不需要调用，服务会自动定期保存。
+手动触发状态落库（强制 flush + WAL checkpoint），正常情况下不需要调用，服务会自动定期落库。
+
+#### `GET /export_state`
+导出与旧版 JSON 状态格式兼容的全量快照，用于备份或迁移。返回 JSON 格式。
 
 #### `POST /shutdown`
 优雅关闭 Tracker 服务，关闭前会自动保存状态。
@@ -831,7 +809,7 @@ UDP 模式下的 key 是 4 字节整数，服务端按以下优先级从 `TRACKE
 | BEP 7 | IPv6 Tracker Extension | 完整支持，`peers` 为 IPv4，`peers6` 为 IPv6 |
 | BEP 15 | UDP Tracker Protocol | 完整支持，基于 asyncio 实现 |
 | BEP 23 | Tracker Returns Compact Peer Lists | 完整支持，`compact=1` 启用 |
-| BEP 48 | Tracker Protocol Extension: Scrape | 完整支持，最多 74 个 info_hash |
+| BEP 48 | Tracker Protocol Extension: Scrape | 完整支持，最多 `MAX_SCRAPE_HASHES` 个 info_hash |
 
 ### BEP 3 兼容细节
 - 完整返回 `interval`、`min interval`、`complete`、`incomplete`、`downloaded` 字段
@@ -850,11 +828,11 @@ UDP 模式下的 key 是 4 字节整数，服务端按以下优先级从 `TRACKE
 
 ## 注意事项
 
-1. **数据持久化**：本 Tracker 是内存型服务，所有运行时数据都在内存中，依赖定期自动保存到 JSON 文件。服务意外重启会丢失最后一次自动保存之后的数据。
+1. **数据持久化**：本 Tracker 是内存型服务，所有运行时数据都在内存中，通过 SQLite（WAL 模式，Write-Behind 异步批量落库）持久化。服务意外重启最多丢失最近 `DB_FLUSH_INTERVAL`（默认 3 秒）内的数据。
 
-2. **状态文件安全**：写入使用临时文件 + `os.replace` 原子替换，保证文件完整性。如果状态文件损坏无法解析，会自动备份为 `.corrupt.<timestamp>` 后缀文件，并保留内存中的现有状态。
+2. **数据库文件安全**：SQLite 使用 WAL 模式，默认每 300 秒执行 WAL checkpoint 确保数据落盘。启动时若 SQLite 为空，会自动从旧版 `tracker_state.json` 一次性迁移数据到 SQLite，迁移成功后将 JSON 文件重命名为 `.migrated.<timestamp>` 归档。
 
-3. **API 密钥安全**：未设置 `TRACKER_API_KEY` 时，所有管理端点（`/stats`、`/shutdown` 等）将完全暴露，公网部署前必须设置强密钥。
+3. **API 密钥安全**：未设置 `TRACKER_API_KEY` 时，所有管理端点（`/stats`、`/save_state`、`/shutdown`、`/add_torrent_info`、`/export_state`）将被禁用，日志中会记录警告。公网部署前必须设置强密钥。
 
 4. **私有 IP 过滤**：默认 `TRACKER_ALLOW_PRIVATE_IP=true`，适合内网测试使用；公网部署建议设为 `false`，防止无效的内网 IP 污染 peer 列表。
 
@@ -866,7 +844,7 @@ UDP 模式下的 key 是 4 字节整数，服务端按以下优先级从 `TRACKE
 
 8. **HTTPS 不推荐用于 announce**：绝大多数 BT 客户端对 HTTPS Tracker 支持不好，建议 announce 和 scrape 端点直接使用 HTTP，管理 API 和 `/metrics` 端点可以走 HTTPS 反向代理。
 
-9. **状态文件备份**：`tracker_state.json` 是唯一的数据文件，建议定期备份，防止磁盘损坏导致数据丢失。
+9. **数据库备份**：`tracker_state.db`（SQLite）是唯一的数据文件，建议定期备份。可使用 `GET /export_state` 端点导出 JSON 格式快照作为额外备份。
 
 10. **速率限制**：HTTP 和 UDP 均默认启用速率限制。如果作为内网 Tracker 使用且流量较大，可根据需要调整 `HTTP_RATE_LIMIT_RPS`、`HTTP_RATE_LIMIT_BURST`、`UDP_RATE_LIMIT_PACKET_PER_SEC` 等参数或关闭限制。
 
