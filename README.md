@@ -49,6 +49,7 @@
     - [`GET /announce`](#get-announce)
     - [`GET /scrape` 或 `GET /scrape/<hash1>/<hash2>/...`](#get-scrape-或-get-scrapehash1hash2)
   - [管理端点（需要 `X-API-Key` 请求头）](#管理端点需要-x-api-key-请求头)
+    - [`GET /export_state`](#get-export_state)
     - [`POST /add_torrent_info`](#post-add_torrent_info)
     - [`GET /stats`](#get-stats)
     - [`POST /save_state`](#post-save_state)
@@ -130,7 +131,7 @@ export TRACKER_API_KEY="your-secret-key-change-this"
 export TRACKER_PORT=6969
 export TRACKER_UDP_PORT=6969
 export TRACKER_DB_FILE="/opt/bittorrent-tracker/data/tracker_state.db"
-export PEER_TIMEOUT=1800
+export TRACKER_PEER_TIMEOUT=1800
 export AUTO_SAVE_INTERVAL=300
 export LOG_LEVEL="INFO"
 
@@ -199,7 +200,7 @@ LOG_LEVEL=INFO
 # 间隔配置
 TRACKER_MIN_INTERVAL=900
 TRACKER_INTERVAL=1800
-PEER_TIMEOUT=1800
+TRACKER_PEER_TIMEOUT=1800
 
 # 存储配置
 TRACKER_DB_FILE=/opt/bittorrent-tracker/data/tracker_state.db
@@ -395,7 +396,7 @@ services:
       - TRACKER_ALLOW_PRIVATE_IP=false
       - TRACKER_BEHIND_PROXY=true
       - LOG_LEVEL=INFO
-      - PEER_TIMEOUT=1800
+      - TRACKER_PEER_TIMEOUT=1800
       - AUTO_SAVE_INTERVAL=300
     ulimits:
       nofile:
@@ -508,7 +509,7 @@ TRACKER_IP = "0.0.0.0"
 TRACKER_PORT = 6969
 TRACKER_API_KEY = "your-secret-key"
 LOG_LEVEL = "INFO"
-PEER_TIMEOUT = 1800
+TRACKER_PEER_TIMEOUT = 1800
 TRACKER_DB_FILE = "tracker_state.db"
 TRACKER_DB_FLUSH_INTERVAL = 3
 ```
@@ -535,7 +536,7 @@ TRACKER_DB_FLUSH_INTERVAL = 3
 |---------|--------|------|
 | `TRACKER_MIN_INTERVAL` / `MIN_INTERVAL` | `900` | 最小 announce 间隔（秒），客户端不得低于此频率重新 announce。BEP 3 规定为 900 秒（15 分钟） |
 | `TRACKER_INTERVAL` | 同 `MIN_INTERVAL` | 普通重 announce 间隔（秒），客户端建议按此间隔刷新 |
-| `PEER_TIMEOUT` | `1800` | Peer 过期时间（秒），超时未更新的 peer 将被自动清理。默认 30 分钟 |
+| `TRACKER_PEER_TIMEOUT` / `PEER_TIMEOUT` | `1800` | Peer 过期时间（秒），超时未更新的 peer 将被自动清理。默认 30 分钟 |
 
 ### 数据存储配置
 
@@ -547,8 +548,8 @@ Tracker 使用 SQLite 作为主存储（WAL 模式，Write-Behind 异步批量�
 | `TRACKER_DATA_FILE` / `DATA_FILE` | `tracker_state.json` | 旧版 JSON 状态文件路径（仅用于一次性迁移，不再作为主存储） |
 | `TRACKER_DB_FLUSH_INTERVAL` | `3` | SQLite 异步批量落库间隔（秒），默认 3 秒 |
 | `TRACKER_DB_FLUSH_BATCH` | `5000` | SQLite 单次批量落库最大行数 |
-| `AUTO_SAVE_INTERVAL` | `300` | 强制落库 + WAL checkpoint 间隔（秒），默认 5 分钟 |
-| `CLEANUP_INTERVAL` | `120` | 过期 peer 清理间隔（秒），默认 2 分钟 |
+| `TRACKER_AUTO_SAVE_INTERVAL` / `AUTO_SAVE_INTERVAL` | `300` | 强制落库 + WAL checkpoint 间隔（秒），默认 5 分钟 |
+| `TRACKER_CLEANUP_INTERVAL` / `CLEANUP_INTERVAL` | `120` | 过期 peer 清理间隔（秒），默认 2 分钟 |
 | `TRACKER_DB_STATS_HISTORY` | `true` | 是否启用 stats_history 表（定期采样种子计数，用于事后趋势分析） |
 | `TRACKER_STATS_HISTORY_INTERVAL` | `60` | stats_history 采样间隔（秒），默认 60 秒 |
 | `TRACKER_STATS_HISTORY_RETENTION` | `604800` | stats_history 数据保留时间（秒），默认 7 天 |
@@ -557,13 +558,13 @@ Tracker 使用 SQLite 作为主存储（WAL 模式，Write-Behind 异步批量�
 
 | 环境变量 | 默认值 | 说明 |
 |---------|--------|------|
-| `MAX_PEERS_PER_TORRENT` | `1000` | 每个种子最大 peer 数量，达到上限后拒绝新 peer 加入（已存在的 peer 仍可更新） |
-| `MAX_TORRENTS` | `1000000` | 全局最大种子数量，达到上限后拒绝新 info_hash 的 announce |
-| `MAX_NUMWANT` | `200` | 单次 announce 返回 peer 数量的上限，对应客户端如 `numwant=-1`（尽可能多）的情况 |
-| `MAX_UDP_CONNECTIONS` | `100000` | UDP 连接表最大条目数，采用 LRU 策略自动淘汰最久未使用的连接 |
-| `MAX_UDP_PACKET_SIZE` | `4096` | UDP 单个数据包最大字节数，超过此大小的包直接丢弃 |
-| `MAX_HTTP_BODY_SIZE` | `65536` | HTTP 请求体最大字节数（64KB），用于 `/add_torrent_info` 等 POST 接口 |
-| `MAX_SCRAPE_HASHES` | `74` | 单次 scrape 请求最多查询的 info_hash 数量 |
+| `TRACKER_MAX_PEERS_PER_TORRENT` / `MAX_PEERS_PER_TORRENT` | `1000` | 每个种子最大 peer 数量，达到上限后拒绝新 peer 加入（已存在的 peer 仍可更新） |
+| `TRACKER_MAX_TORRENTS` / `MAX_TORRENTS` | `1000000` | 全局最大种子数量，达到上限后拒绝新 info_hash 的 announce |
+| `TRACKER_MAX_NUMWANT` / `MAX_NUMWANT` | `200` | 单次 announce 返回 peer 数量的上限，对应客户端如 `numwant=-1`（尽可能多）的情况 |
+| `TRACKER_MAX_UDP_CONNECTIONS` / `MAX_UDP_CONNECTIONS` | `100000` | UDP 连接表最大条目数，采用 LRU 策略自动淘汰最久未使用的连接 |
+| `TRACKER_MAX_UDP_PACKET_SIZE` / `MAX_UDP_PACKET_SIZE` | `4096` | UDP 单个数据包最大字节数，超过此大小的包直接丢弃 |
+| `TRACKER_MAX_HTTP_BODY_SIZE` / `MAX_HTTP_BODY_SIZE` | `65536` | HTTP 请求体最大字节数（64KB），用于 `/add_torrent_info` 等 POST 接口 |
+| `TRACKER_MAX_SCRAPE_HASHES` | `74` | 单次 scrape 请求最多查询的 info_hash 数量 |
 
 ### 防 info_hash 洪水配置
 
@@ -590,8 +591,8 @@ Tracker 使用 SQLite 作为主存储（WAL 模式，Write-Behind 异步批量�
 
 | 环境变量 | 默认值 | 说明 |
 |---------|--------|------|
-| `UDP_CONNECTION_TIMEOUT` | `120` | UDP 连接 ID 有效期（秒），不建议修改 |
-| `UDP_CONN_CLEANUP_INTERVAL` | `30` | UDP 过期连接清理间隔（秒） |
+| `TRACKER_UDP_CONNECTION_TIMEOUT` / `UDP_CONNECTION_TIMEOUT` | `120` | UDP 连接 ID 有效期（秒），不建议修改 |
+| `TRACKER_UDP_CONN_CLEANUP_INTERVAL` / `UDP_CONN_CLEANUP_INTERVAL` | `30` | UDP 过期连接清理间隔（秒） |
 
 ### UDP 速率限制配置（防 DDoS）
 
@@ -701,7 +702,7 @@ BitTorrent scrape 端点，用于批量查询种子统计信息。
 
 - `info_hash` 参数可重复指定，查询多个种子
 - URL 路径支持直接写十六进制 info_hash，多个用 `/` 分隔
-- 单次最多查询 `MAX_SCRAPE_HASHES` 个 info_hash（默认 74），可通过环境变量或 TOML 配置
+- 单次最多查询 `TRACKER_MAX_SCRAPE_HASHES` 个 info_hash（默认 74），可通过环境变量或 TOML 配置
 
 响应为 bencode 编码格式，包含每个种子的 `complete`（做种数）、`downloaded`（完成数）、`incomplete`（下载数）。
 
@@ -809,7 +810,7 @@ UDP 模式下的 key 是 4 字节整数，服务端按以下优先级从 `TRACKE
 | BEP 7 | IPv6 Tracker Extension | 完整支持，`peers` 为 IPv4，`peers6` 为 IPv6 |
 | BEP 15 | UDP Tracker Protocol | 完整支持，基于 asyncio 实现 |
 | BEP 23 | Tracker Returns Compact Peer Lists | 完整支持，`compact=1` 启用 |
-| BEP 48 | Tracker Protocol Extension: Scrape | 完整支持，最多 `MAX_SCRAPE_HASHES` 个 info_hash |
+| BEP 48 | Tracker Protocol Extension: Scrape | 完整支持，最多 `TRACKER_MAX_SCRAPE_HASHES` 个 info_hash |
 
 ### BEP 3 兼容细节
 - 完整返回 `interval`、`min interval`、`complete`、`incomplete`、`downloaded` 字段
